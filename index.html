@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Shadow Lens</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Kaushan+Script&display=swap" rel="stylesheet">
+<style>
+  :root { --o:#ffa91f; --bg:#050505; }
+  * { box-sizing:border-box; margin:0; }
+  html,body { height:100%; background:var(--bg); color:#fff; font-family:system-ui,-apple-system,Segoe UI,sans-serif; overflow:hidden; }
+  #stage { position:fixed; inset:0; display:grid; place-items:center; padding-bottom:110px; }
+  canvas#out { width:min(100vw, calc(100dvh - 130px)); aspect-ratio:1; display:block; }
+  video { display:none; }
+  #namebar { position:fixed; top:calc(12px + env(safe-area-inset-top)); left:50%; transform:translateX(-50%); z-index:7;
+             display:flex; align-items:center; gap:8px; background:#000c; border:1px solid #ffa91f66; border-radius:99px; padding:6px 8px 6px 14px; width:min(92vw,360px); }
+  #namebar span { font-size:13px; color:#ffa91f; white-space:nowrap; }
+  #namebar input { flex:1; min-width:0; background:transparent; border:0; outline:0; color:#fff; font-size:16px; font-weight:600; }
+  #namebar input::placeholder { color:#777; font-weight:400; }
+  #status { position:absolute; top:68px; left:50%; transform:translateX(-50%); background:#000b; border:1px solid #ffa91f55;
+            padding:8px 14px; border-radius:99px; font-size:14px; text-align:center; max-width:92vw; z-index:5; }
+  #status.hide { display:none; }
+  #bar { position:fixed; left:0; right:0; bottom:0; padding:12px 16px calc(14px + env(safe-area-inset-bottom));
+         display:flex; justify-content:center; align-items:center; gap:26px; background:linear-gradient(transparent,#000d 40%); z-index:4; }
+  .round { width:48px; height:48px; border-radius:50%; border:1px solid #ffffff33; background:#ffffff14; color:#fff; font-size:20px; cursor:pointer; }
+  .round:hover { background:#ffffff26; }
+  #snap { width:72px; height:72px; border-radius:50%; border:4px solid #fff; background:var(--o); cursor:pointer; box-shadow:0 0 0 4px #0008 inset; }
+  #snap:active { transform:scale(.93); }
+  #panel { position:fixed; left:50%; transform:translateX(-50%); bottom:calc(112px + env(safe-area-inset-bottom)); width:min(94vw,440px);
+           background:#0c0c0cf2; border:1px solid #ffa91f44; border-radius:16px; padding:14px 16px; z-index:6; display:none; }
+  #panel.open { display:block; }
+  #panel h3 { font-size:13px; letter-spacing:.08em; text-transform:uppercase; color:var(--o); margin-bottom:10px; }
+  .row { display:flex; align-items:center; gap:10px; margin:9px 0; font-size:14px; }
+  .row label { flex:0 0 118px; color:#ddd; }
+  .row input[type=range] { flex:1; accent-color:var(--o); }
+  .row input[type=text] { flex:1; background:#1a1a1a; border:1px solid #333; border-radius:8px; color:#fff; padding:7px 9px; font-size:14px; }
+  .row input[type=checkbox] { accent-color:var(--o); width:18px; height:18px; }
+  #flash { position:fixed; inset:0; background:#fff; opacity:0; pointer-events:none; z-index:10; transition:opacity .35s; }
+  #flash.go { opacity:.85; transition:none; }
+</style>
+</head>
+<body>
+<div id="namebar"><span>Your name</span><input id="nm" type="text" maxlength="18" placeholder="A Guy" autocomplete="off" autocapitalize="words" aria-label="Your name"><span>with Shadow</span></div>
+<div id="stage">
+  <canvas id="out"></canvas>
+  <video id="cam" playsinline muted></video>
+  <div id="status">Loading the AI model…</div>
+</div>
+
+<div id="panel">
+  <h3>Adjust your shadow lens</h3>
+  <div class="row"><label for="dist">Shadow distance</label><input id="dist" type="range" min="0.05" max="0.4" step="0.01" value="0.20"></div>
+  <div class="row"><label for="squeeze">Shadow width</label><input id="squeeze" type="range" min="0.45" max="1.1" step="0.01" value="0.82"></div>
+  <div class="row"><label for="l2">Title line 2</label><input id="l2" type="text" value="Shadow" maxlength="16"></div>
+  <div class="row"><label for="side">Shadow on left</label><input id="side" type="checkbox"></div>
+  <div class="row"><label for="inv">Invert cutout</label><input id="inv" type="checkbox"><span style="font-size:12px;color:#999">only if the background shows instead of you</span></div>
+</div>
+
+<div id="bar">
+  <button class="round" id="flip" title="Flip camera">⟲</button>
+  <button id="snap" title="Take photo" aria-label="Take photo"></button>
+  <button class="round" id="gear" title="Adjust">⚙</button>
+</div>
+<div id="flash"></div>
+
+<script type="module">
+import { ImageSegmenter, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const WASM  = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm";
+const MODEL = "https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite";
+const S = 1080;                       // output is a square, like a logo/profile picture
+const GRADE = "sepia(.30) contrast(1.15) saturate(1.1) brightness(.95)";  // warm grade on you (skipped where ctx.filter is unsupported)
+
+const $ = id => document.getElementById(id);
+const video = $("cam"), out = $("out"), ctx = out.getContext("2d");
+out.width = out.height = S;
+
+const mk = (w = S, h = S) => { const c = document.createElement("canvas"); c.width = w; c.height = h; return c; };
+const comp = mk(), cc = comp.getContext("2d");        // background + shadow + person
+const cut  = mk(), kc = cut.getContext("2d");         // you, cut out
+const maskBlack = mk(4, 4), maskGlow = mk(4, 4);      // resized once the first mask arrives
+let mbx = maskBlack.getContext("2d"), mgx = maskGlow.getContext("2d");
+let id0, id1, prev = null, mw = 0, mh = 0;
+
+const settings = { dist: .20, squeeze: .82, line1: "A Guy with", line2: "Shadow", flipSide: false, invert: false };
+let facing = "user", stream = null, segmenter = null, hasMask = false, autoPol = 1;
+
+/* ---------- static art: brush ring + film grain ---------- */
+function rng(seed) { return () => (seed = (seed * 16807) % 2147483647) / 2147483647; }
+
+function makeRing() {
+  const c = mk(), x = c.getContext("2d"), r = rng(7);
+  x.strokeStyle = "#ffa91f"; x.lineCap = "round";
+  for (let pass = 0; pass < 5; pass++) {
+    const base = S * (0.455 + (r() - .5) * 0.012), off = r() * 6.28;
+    let a = 0;
+    while (a < Math.PI * 2) {
+      const step = 0.03 + r() * 0.05, th = off + a;
+      x.lineWidth = S * (0.004 + r() * 0.012) * (pass === 0 ? 1.6 : 1);
+      x.globalAlpha = pass === 0 ? 1 : .55 + r() * .4;
+      const rad = base + (r() - .5) * S * 0.006;
+      x.beginPath(); x.arc(S / 2, S / 2, rad, th, th + step + 0.01); x.stroke();
+      a += step;
+    }
+  }
+  return c;
+}
+const ringCanvas = makeRing();
+
+const noise = (() => {
+  const c = mk(256, 256), x = c.getContext("2d"), d = x.createImageData(256, 256);
+  for (let i = 0; i < d.data.length; i += 4) { const v = Math.random() * 255; d.data[i] = d.data[i+1] = d.data[i+2] = v; d.data[i+3] = 255; }
+  x.putImageData(d, 0, 0);
+  return cc.createPattern(c, "repeat");
+})();
+
+/* ---------- mask handling ---------- */
+function onResult(res) {
+  const list = res.confidenceMasks;
+  if (!list || !list.length) return;
+  const m = list.length > 1 ? list[1] : list[0];       // person channel
+  const w = m.width, h = m.height, arr = m.getAsFloat32Array();
+
+  if (w !== mw || h !== mh) {
+    mw = w; mh = h;
+    maskBlack.width = maskGlow.width = w; maskBlack.height = maskGlow.height = h;
+    mbx = maskBlack.getContext("2d"); mgx = maskGlow.getContext("2d");
+    id0 = new ImageData(w, h); id1 = new ImageData(w, h); prev = new Float32Array(w * h);
+  }
+
+  // auto-detect which way the mask is polarised: you are centre-frame, corners are background
+  const at = (fx, fy) => arr[Math.min(h - 1, (fy * h) | 0) * w + Math.min(w - 1, (fx * w) | 0)];
+  const centre  = (at(.5, .6) + at(.5, .75) + at(.4, .7) + at(.6, .7)) / 4;
+  const corners = (at(.04, .04) + at(.96, .04) + at(.04, .5) + at(.96, .5)) / 4;
+  if (Math.abs(centre - corners) > .25) autoPol = centre > corners ? 1 : -1;
+  const inv = (autoPol === -1) !== settings.invert;
+
+  const d0 = id0.data, d1 = id1.data;
+  for (let i = 0, n = w * h; i < n; i++) {
+    let v = arr[i]; if (inv) v = 1 - v;
+    v = (v - .4) / .3; v = v < 0 ? 0 : v > 1 ? 1 : v;   // tighten the edge
+    v = prev[i] * .35 + v * .65; prev[i] = v;            // light temporal smoothing
+    const a = (v * 255) | 0, j = i * 4;
+    d0[j] = d0[j+1] = d0[j+2] = 0;       d0[j+3] = a;    // black silhouette (for the shadow)
+    d1[j] = 255; d1[j+1] = 150; d1[j+2] = 25; d1[j+3] = a; // orange silhouette (for the rim light)
+  }
+  mbx.putImageData(id0, 0, 0); mgx.putImageData(id1, 0, 0);
+  hasMask = true;
+}
+
+function drawMask(c2, src) {   // square centre-crop, same crop as the video
+  const mm = Math.min(mw, mh);
+  c2.drawImage(src, (mw - mm) / 2, (mh - mm) / 2, mm, mm, 0, 0, S, S);
+}
+
+/* ---------- rendering ---------- */
+const DC = { x: S / 2, y: S * .41, r: S * .336 };   // the sun disc
+
+function fitFont(x, text, size, maxW) {
+  x.font = `${size}px "Kaushan Script","Brush Script MT",cursive`;
+  const w = x.measureText(text).width;
+  if (w > maxW) size *= maxW / w;
+  x.font = `${size}px "Kaushan Script","Brush Script MT",cursive`;
+}
+
+function drawTitle(x) {
+  x.save();
+  x.translate(S * .5, S * .78); x.rotate(-.1);
+  x.textAlign = "center"; x.textBaseline = "alphabetic";
+  x.shadowColor = "rgba(0,0,0,.65)"; x.shadowBlur = 14;
+  fitFont(x, settings.line1, S * .105, S * .60); x.fillStyle = "#f6ead6";
+  x.fillText(settings.line1, -S * .03, -S * .02);
+  fitFont(x, settings.line2, S * .16, S * .62); x.fillStyle = "#ffa91f";
+  x.fillText(settings.line2, S * .04, S * .105);
+  // tapered brush underline
+  x.shadowBlur = 0; x.fillStyle = "#ffa91f";
+  x.beginPath();
+  x.moveTo(-S * .22, S * .165);
+  x.quadraticCurveTo(0, S * .125, S * .27, S * .135);
+  x.quadraticCurveTo(0, S * .145, -S * .22, S * .165);
+  x.fill();
+  x.restore();
+}
+
+function render() {
+  const mirror = facing === "user";
+  const side = (mirror ? -1 : 1) * (settings.flipSide ? -1 : 1);   // unmirrored-space sign that means "display right"
+  const pdx = -side * S * .07;                                       // person nudged away from the shadow
+  const sdx = pdx + side * S * settings.dist;                        // shadow sits to the other side
+
+  cc.clearRect(0, 0, S, S);
+  cc.save();
+  cc.beginPath(); cc.arc(S / 2, S / 2, S * .475, 0, 7); cc.clip();
+  cc.fillStyle = "#070707"; cc.fillRect(0, 0, S, S);
+
+  // sun disc with glow
+  const g = cc.createRadialGradient(DC.x, DC.y - DC.r * .1, DC.r * .1, DC.x, DC.y, DC.r);
+  g.addColorStop(0, "#ffb82e"); g.addColorStop(.7, "#f59a10"); g.addColorStop(1, "#d97706");
+  cc.save(); cc.shadowColor = "rgba(255,150,0,.35)"; cc.shadowBlur = 70;
+  cc.fillStyle = g; cc.beginPath(); cc.arc(DC.x, DC.y, DC.r, 0, 7); cc.fill(); cc.restore();
+
+  // your shadow, cast on the disc only
+  cc.save();
+  cc.beginPath(); cc.arc(DC.x, DC.y, DC.r, 0, 7); cc.clip();
+  cc.globalAlpha = .9; cc.shadowColor = "#000"; cc.shadowBlur = 14;
+  cc.translate(S / 2 + sdx, S * .62);
+  cc.scale(1.12 * settings.squeeze, 1.12);
+  cc.translate(-S / 2, -S * .62);
+  drawMask(cc, maskBlack);
+  cc.restore();
+
+  // film grain on the disc
+  cc.save();
+  cc.beginPath(); cc.arc(DC.x, DC.y, DC.r, 0, 7); cc.clip();
+  cc.globalCompositeOperation = "overlay"; cc.globalAlpha = .22;
+  cc.translate((Math.random() * 256) | 0, (Math.random() * 256) | 0);
+  cc.fillStyle = noise; cc.fillRect(-256, -256, S + 512, S + 512);
+  cc.restore();
+
+  // warm rim light behind you
+  cc.save(); cc.translate(pdx, 0);
+  cc.shadowColor = "rgba(255,160,30,.95)"; cc.shadowBlur = 26;
+  drawMask(cc, maskGlow);
+  cc.restore();
+
+  // you, cut out
+  const vw = video.videoWidth, vh = video.videoHeight, m = Math.min(vw, vh);
+  kc.globalCompositeOperation = "source-over"; kc.clearRect(0, 0, S, S);
+  try { kc.filter = GRADE; } catch (e) {}
+  kc.drawImage(video, (vw - m) / 2, (vh - m) / 2, m, m, 0, 0, S, S);
+  try { kc.filter = "none"; } catch (e) {}
+  kc.globalCompositeOperation = "destination-in";
+  drawMask(kc, maskBlack);
+  kc.globalCompositeOperation = "source-over";
+  cc.drawImage(cut, pdx, 0);
+
+  // fade the body into black so the title reads
+  const f = cc.createLinearGradient(0, S * .62, 0, S * .93);
+  f.addColorStop(0, "rgba(5,5,5,0)"); f.addColorStop(1, "rgba(5,5,5,1)");
+  cc.fillStyle = f; cc.fillRect(0, S * .6, S, S * .4);
+  cc.restore();
+
+  // final frame: mirrored picture, un-mirrored ring + title
+  ctx.clearRect(0, 0, S, S);
+  ctx.save();
+  if (mirror) { ctx.translate(S, 0); ctx.scale(-1, 1); }
+  ctx.drawImage(comp, 0, 0);
+  ctx.restore();
+  ctx.drawImage(ringCanvas, 0, 0);
+  drawTitle(ctx);
+}
+
+/* ---------- camera + model ---------- */
+const status = $("status");
+const say = t => { status.textContent = t; status.classList.remove("hide"); };
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  say("Allow camera access when your browser asks…");
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+    });
+  } catch (e) {
+    const n = (e && e.name) || "Error";
+    const where = location.protocol === "file:" ? " This page is opened as a local file; if the camera icon in the address bar says blocked, click it and choose Allow." : "";
+    const msgs = {
+      NotAllowedError: "The browser refused camera access (NotAllowedError)." + where + " Also check Windows Settings > Privacy & security > Camera. If this page is inside a preview pane, open the file directly in Chrome or Edge instead.",
+      NotFoundError: "No camera was found on this device (NotFoundError). Plug one in or check it is enabled.",
+      NotReadableError: "The camera is busy (NotReadableError). Close Zoom, Teams, OBS or other tabs using it, then retry.",
+      SecurityError: "The browser blocked the camera for security reasons (SecurityError). Serve the page from localhost."
+    };
+    say((msgs[n] || ("Camera error: " + n + ". " + (e.message || ""))) + "  ");
+    const b = document.createElement("button");
+    b.textContent = "Try again"; b.style.cssText = "margin-left:8px;padding:4px 12px;border-radius:99px;border:0;background:#ffa91f;font-weight:600;cursor:pointer";
+    b.onclick = () => location.reload();
+    status.appendChild(b);
+    throw e;
+  }
+  video.srcObject = stream; await video.play();
+  hasMask = false;
+  say("Step into frame. Starting the cutout…");
+}
+
+async function initModel() {
+  const fs = await FilesetResolver.forVisionTasks(WASM);
+  const opts = d => ({ baseOptions: { modelAssetPath: MODEL, delegate: d }, runningMode: "VIDEO", outputConfidenceMasks: true, outputCategoryMask: false });
+  try { segmenter = await ImageSegmenter.createFromOptions(fs, opts("GPU")); }
+  catch (e) { segmenter = await ImageSegmenter.createFromOptions(fs, opts("CPU")); }
+}
+
+let lastT = -1;
+function loop() {
+  if (segmenter && video.readyState >= 2) {
+    if (video.currentTime !== lastT) {
+      lastT = video.currentTime;
+      try { segmenter.segmentForVideo(video, performance.now(), onResult); } catch (e) { console.error(e); }
+    }
+    if (hasMask) { render(); status.classList.add("hide"); }
+  }
+  requestAnimationFrame(loop);
+}
+
+/* ---------- UI ---------- */
+$("gear").onclick = () => $("panel").classList.toggle("open");
+$("flip").onclick = async () => { facing = facing === "user" ? "environment" : "user"; await startCamera(); };
+$("dist").oninput    = e => settings.dist = +e.target.value;
+$("squeeze").oninput = e => settings.squeeze = +e.target.value;
+const setName = n => { settings.line1 = ((n || "").trim() || "A Guy") + " with"; };
+$("nm").oninput = e => setName(e.target.value);
+$("nm").addEventListener("keydown", e => { if (e.key === "Enter") e.target.blur(); });
+$("l2").oninput = e => settings.line2 = e.target.value;
+try {                                    // share link: shadow-lens.html?name=Sara
+  const q = new URLSearchParams(location.search).get("name");
+  if (q) { $("nm").value = q.slice(0, 18); setName(q.slice(0, 18)); }
+} catch (e) {}
+$("side").onchange = e => settings.flipSide = e.target.checked;
+$("inv").onchange  = e => settings.invert = e.target.checked;
+
+$("snap").onclick = () => {
+  const fl = $("flash"); fl.classList.add("go"); setTimeout(() => fl.classList.remove("go"), 60);
+  out.toBlob(b => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(b); a.download = "shadow-lens-" + Date.now() + ".png"; a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 3000);
+  }, "image/png");
+};
+
+(async () => {
+  try { await document.fonts.load('80px "Kaushan Script"'); } catch (e) {}
+  try {
+    await Promise.all([initModel(), startCamera()]);
+    say("Step into frame. Starting the cutout…");
+    loop();
+  } catch (e) {
+    console.error(e);
+    const camErr = ["NotAllowedError","NotFoundError","NotReadableError","SecurityError","OverconstrainedError","AbortError"].includes(e && e.name);
+    if (!camErr) say("Couldn't load the AI model. Check your internet connection and reload.");
+  }
+})();
+</script>
+</body>
+</html>
